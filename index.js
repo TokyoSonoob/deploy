@@ -14,19 +14,19 @@ const PORT = Number(process.env.PORT || 3000);
 
 if (!DISCORD_TOKEN) process.exit(1);
 
-const CHECK_EVERY_MS = 60 * 1000;
-const RECHECK_AFTER_DEPLOY_MS = 10 * 60 * 1000;
+const CHECK_EVERY_MS = 60000;
+const RECHECK_AFTER_DEPLOY_MS = 600000;
 
 function parseBotEnv(envKey) {
   const raw = process.env[envKey];
   if (!raw) return null;
-  const match = raw.match(/^\s*\{\s*"?(https?:\/\/[^"]+)"?\s*,\s*"?(https?:\/\/[^"]+)"?\s*\}\s*$/);
-  if (!match) return null;
+  const m = raw.match(/^\s*\{\s*"?(https?:\/\/[^"]+)"?\s*,\s*"?(https?:\/\/[^"]+)"?\s*\}\s*$/);
+  if (!m) return null;
   return {
     id: envKey,
     name: envKey,
-    url: match[1],
-    deployUrl: match[2],
+    url: m[1],
+    deployUrl: m[2],
     status: "unknown",
     lastDeployAt: 0,
     lastCheckAt: 0,
@@ -38,36 +38,35 @@ function parseBotEnv(envKey) {
 const BOTS = [];
 for (const key of Object.keys(process.env)) {
   if (/^bot\d+$/i.test(key)) {
-    const bot = parseBotEnv(key);
-    if (bot) BOTS.push(bot);
+    const b = parseBotEnv(key);
+    if (b) BOTS.push(b);
   }
 }
+
+BOTS.sort((a, b) => {
+  const na = parseInt(a.id.slice(3), 10) || 0;
+  const nb = parseInt(b.id.slice(3), 10) || 0;
+  return na - nb;
+});
 
 if (BOTS.length === 0) process.exit(1);
 
 let checking = false;
 
 const STATUS_FILE = "./.statusMessageId";
-const globalState = {
-  statusMessageId: null,
-  lastLoopMs: 0
-};
+const globalState = { statusMessageId: null, lastLoopMs: 0 };
 
 if (fs.existsSync(STATUS_FILE)) {
   try {
-    const saved = fs.readFileSync(STATUS_FILE, "utf8").trim();
-    if (saved) globalState.statusMessageId = saved;
+    const id = fs.readFileSync(STATUS_FILE, "utf8").trim();
+    if (id) globalState.statusMessageId = id;
   } catch {}
 }
 
 function simpleRequest(rawUrl) {
   return new Promise((resolve, reject) => {
     let u;
-    try {
-      u = new URL(rawUrl);
-    } catch {
-      return reject("bad-url");
-    }
+    try { u = new URL(rawUrl); } catch { return reject("bad-url"); }
     const lib = u.protocol === "http:" ? http : https;
     const started = Date.now();
     const req = lib.request(
@@ -83,10 +82,7 @@ function simpleRequest(rawUrl) {
         resolve({ statusCode: res.statusCode || 0, duration: Date.now() - started });
       }
     );
-    req.on("timeout", () => {
-      req.destroy();
-      reject("timeout");
-    });
+    req.on("timeout", () => { req.destroy(); reject("timeout"); });
     req.on("error", reject);
     req.end();
   });
@@ -94,7 +90,10 @@ function simpleRequest(rawUrl) {
 
 function discordApi(path, method, body) {
   return new Promise((resolve, reject) => {
-    const data = body ? JSON.stringify(body) : null;
+    let data = null;
+    if (body) {
+      try { data = JSON.stringify(body); } catch {}
+    }
     const req = https.request(
       {
         hostname: "discord.com",
@@ -108,17 +107,11 @@ function discordApi(path, method, body) {
       },
       res => {
         let raw = "";
-        res.on("data", c => (raw += c));
+        res.on("data", c => raw += c);
         res.on("end", () => {
-          const code = res.statusCode || 0;
-          if (code >= 400) {
-            return reject(new Error(`HTTP ${code}: ${raw}`));
-          }
-          try {
-            resolve(raw ? JSON.parse(raw) : null);
-          } catch {
-            resolve(null);
-          }
+          if ((res.statusCode || 0) >= 400) return reject(new Error("http " + res.statusCode));
+          if (!raw) return resolve(null);
+          try { resolve(JSON.parse(raw)); } catch { resolve(null); }
         });
       }
     );
@@ -129,29 +122,17 @@ function discordApi(path, method, body) {
 }
 
 async function sendStatusMessage(embed) {
-  const res = await discordApi(
-    `/channels/${DISCORD_STATUS_CHANNEL_ID}/messages`,
-    "POST",
-    { embeds: [embed] }
-  );
-  return res?.id || null;
+  const r = await discordApi(`/channels/${DISCORD_STATUS_CHANNEL_ID}/messages`, "POST", { embeds: [embed] });
+  return r && r.id ? r.id : null;
 }
 
 async function editStatusMessage(id, embed) {
-  await discordApi(
-    `/channels/${DISCORD_STATUS_CHANNEL_ID}/messages/${id}`,
-    "PATCH",
-    { embeds: [embed] }
-  );
+  await discordApi(`/channels/${DISCORD_STATUS_CHANNEL_ID}/messages/${id}`, "PATCH", { embeds: [embed] });
 }
 
 async function sendLog(content) {
   try {
-    await discordApi(
-      `/channels/${DISCORD_LOG_CHANNEL_ID}/messages`,
-      "POST",
-      { content }
-    );
+    await discordApi(`/channels/${DISCORD_LOG_CHANNEL_ID}/messages`, "POST", { content });
   } catch {}
 }
 
@@ -175,14 +156,12 @@ function botStatus(bot) {
   else if (bot.status === "deploying") label = "DEPLOYING";
   else if (bot.status === "adminClosed") label = "ADMIN-CLOSED";
   else if (bot.status === "down") label = "OFFLINE";
-
-  const pingLine = bot.lastPingMs ? `\n• Ping: ${bot.lastPingMs} ms` : "";
-
+  const ping = bot.lastPingMs ? `\n• Ping: ${bot.lastPingMs} ms` : "";
   return (
     `Status: **${label}**\n` +
     `• URL: \`${bot.url}\`\n` +
     `• Last Check: ${bot.lastCheckAt ? fmt(new Date(bot.lastCheckAt)) : "-"}\n` +
-    `• Last Deploy: ${bot.lastDeployAt ? fmt(new Date(bot.lastDeployAt)) : "-"}${pingLine}`
+    `• Last Deploy: ${bot.lastDeployAt ? fmt(new Date(bot.lastDeployAt)) : "-"}${ping}`
   );
 }
 
@@ -190,26 +169,23 @@ function buildEmbed() {
   const mem = process.memoryUsage();
   const rssMb = (mem.rss / 1024 / 1024).toFixed(1);
   const heapMb = (mem.heapUsed / 1024 / 1024).toFixed(1);
-  const uptimeSec = process.uptime();
-
+  const up = process.uptime();
   const monitorField = {
     name: "Monitor",
     value:
       `• RAM: ${rssMb}MB (heap ${heapMb}MB)\n` +
-      `• Uptime: ${fmtUptime(uptimeSec)}\n` +
+      `• Uptime: ${fmtUptime(up)}\n` +
       `• Loop: ${globalState.lastLoopMs}ms\n` +
       `• Interval: ${(CHECK_EVERY_MS / 1000).toFixed(0)}s`
   };
-
+  const botFields = BOTS.map(b => ({
+    name: b.id.toUpperCase(),
+    value: botStatus(b)
+  }));
   return {
     title: "Bot Monitor",
     color: 0x1e1e2f,
-    fields: [monitorField].concat(
-      BOTS.map(b => ({
-        name: b.id.toUpperCase(),
-        value: botStatus(b)
-      }))
-    ),
+    fields: [monitorField].concat(botFields),
     timestamp: new Date().toISOString()
   };
 }
@@ -238,51 +214,39 @@ async function updateStatus() {
 async function deploy(bot, prevStatus) {
   try {
     await simpleRequest(bot.deployUrl);
-    const nowStr = fmt(new Date());
-    await sendLog(
-      `[DEPLOY] ${bot.id} | url=${bot.url} | prev=${prevStatus} | time=${nowStr}`
-    );
+    const ts = fmt(new Date());
+    await sendLog(`[DEPLOY] ${bot.id} | url=${bot.url} | prev=${prevStatus} | time=${ts}`);
   } catch {}
 }
 
 async function checkBot(bot, now) {
   bot.lastCheckAt = now;
-  let isUp = false;
-
+  let up = false;
   try {
     const r = await simpleRequest(bot.url);
-    if (r.statusCode >= 200 && r.statusCode < 400) isUp = true;
+    if (r.statusCode >= 200 && r.statusCode < 400) up = true;
     bot.lastPingMs = r.duration || 0;
   } catch {
-    isUp = false;
+    up = false;
     bot.lastPingMs = 0;
   }
-
   const prev = bot.status;
-
-  if (isUp) {
+  if (up) {
     bot.status = "up";
     bot.failCount = 0;
     bot.lastDeployAt = 0;
     return;
   }
-
   if (bot.status === "deploying") {
-    if (now - bot.lastDeployAt >= RECHECK_AFTER_DEPLOY_MS) {
-      bot.status = "adminClosed";
-    }
+    if (now - bot.lastDeployAt >= RECHECK_AFTER_DEPLOY_MS) bot.status = "adminClosed";
     return;
   }
-
   if (bot.status === "adminClosed") return;
-
   bot.failCount = (bot.failCount || 0) + 1;
-
   if (bot.failCount < 2) {
     bot.status = "down";
     return;
   }
-
   bot.lastDeployAt = now;
   bot.failCount = 0;
   bot.status = "deploying";
@@ -292,21 +256,16 @@ async function checkBot(bot, now) {
 async function checkAll() {
   if (checking) return;
   checking = true;
-
   const t0 = Date.now();
   const now = Date.now();
-
   for (const bot of BOTS) {
     try { await checkBot(bot, now); } catch {}
   }
-
   await updateStatus();
   globalState.lastLoopMs = Date.now() - t0;
-
   if (global.gc) {
     try { global.gc(); } catch {}
   }
-
   checking = false;
 }
 
@@ -327,37 +286,35 @@ function getJsonStatus() {
       lastLoopMs: globalState.lastLoopMs,
       intervalSec: CHECK_EVERY_MS / 1000
     },
-    bots: BOTS.map(bot => ({
-      id: bot.id,
-      url: bot.url,
-      deployUrl: bot.deployUrl,
-      status: bot.status,
-      lastCheckAt: bot.lastCheckAt || null,
-      lastDeployAt: bot.lastDeployAt || null,
-      lastPingMs: bot.lastPingMs || 0,
-      failCount: bot.failCount || 0
+    bots: BOTS.map(b => ({
+      id: b.id,
+      url: b.url,
+      deployUrl: b.deployUrl,
+      status: b.status,
+      lastCheckAt: b.lastCheckAt || null,
+      lastDeployAt: b.lastDeployAt || null,
+      lastPingMs: b.lastPingMs || 0,
+      failCount: b.failCount || 0
     }))
   };
 }
 
 const server = http.createServer((req, res) => {
-  const url = req.url || "/";
-  if (url === "/") {
+  const u = req.url || "/";
+  if (u === "/") {
     res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
     res.end("botdeploy OK");
-  } else if (url === "/status") {
-    const json = JSON.stringify(getJsonStatus());
+  } else if (u === "/status") {
+    const j = JSON.stringify(getJsonStatus());
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-    res.end(json);
+    res.end(j);
   } else {
     res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
     res.end("Not found");
   }
 });
 
-server.listen(PORT, () => {
-  startLoop();
-});
+server.listen(PORT, () => startLoop());
 
 process.on("unhandledRejection", () => {});
 process.on("uncaughtException", () => {});
